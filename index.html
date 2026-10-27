@@ -1,3 +1,4 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
 <!doctype html>
 <html lang="en">
 <head>
@@ -976,6 +977,21 @@ button.chip.playable:active, button.cell.tappable:active { filter: brightness(0.
 @media (prefers-reduced-motion: reduce) { .hold-btn.on { animation: none; } }
 
 .qcard.has-say { padding-top: 48px; }
+
+/* Swap between tapping an option and typing the answer, on the question itself. */
+.ans-switch { display: block; margin: 9px auto 0; padding: 4px 8px; font-size: 14px; font-weight: 550; color: var(--accent); }
+
+/* The Gemini voice: describe her, make her, hear her. */
+.gem-voice { margin-top: 12px; }
+.gem-prompt {
+  display: block; width: 100%; resize: vertical; min-height: 76px; padding: 10px 12px; border-radius: 12px;
+  border: 1px solid var(--hair); background: var(--surface); color: var(--ink); font: inherit; font-size: 14.5px; line-height: 1.45;
+}
+.gem-prompt:focus { outline: none; border-color: var(--accent); }
+.gem-btns { display: flex; align-items: center; gap: 10px; margin-top: 9px; }
+.gem-btns .btn.primary { height: 40px; font-size: 15px; }
+.gem-btns .btn.primary:disabled { opacity: 0.4; }
+#voiceEngine { margin-top: 12px; }
 </style>
 </head>
 <body>
@@ -2978,6 +2994,262 @@ if (typeof module !== 'undefined') module.exports = { Theory, Quiz };
 if (typeof module !== 'undefined') module.exports = { Theory, Quiz };
 </script>
 <script>
+/* ===== Gemini: the free route =====
+   One key from Google AI Studio does two jobs here.
+
+   The voice. Phones have no young New Zealand woman's voice built in
+   (Apple ships none for New Zealand English at all). Gemini's speech models
+   can be given a voice designed from a description — "a young New Zealand
+   woman with a natural Kiwi accent" — and that designed voice then reads the
+   questions.
+
+   The checker, outside the Claude app, when no Anthropic key is set: grading
+   on the light model, reviews on the better one, falling back to the light
+   one when the free allowance for the day runs out.
+
+   The key lives in this browser's storage and goes only to
+   generativelanguage.googleapis.com. Free-tier limits are not published, so
+   every call is written to fail soft: a 429 steps down to a lighter model,
+   and the voice steps down to the device's own when nothing is left. */
+const Gemini = (() => {
+  const BASE = 'https://generativelanguage.googleapis.com/v1beta';
+  const KEY_STORE = 'gooby.gemini.key.v1';
+  const VOICE_STORE = 'gooby.gemini.voice.v1';
+  const SHAPE_STORE = 'gooby.gemini.ttsShape.v1';
+  const MODELS = {
+    review: ['gemini-3.8-flash', 'gemini-3.5-flash-lite'],
+    grade: ['gemini-3.5-flash-lite', 'gemini-3.8-flash'],
+    tts: ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'],
+  };
+  const DEFAULT_PROMPT = 'A young New Zealand woman in her early twenties with a natural, everyday Kiwi accent '
+    + 'from Auckland. Bright, friendly and relaxed.';
+
+  const store = {
+    get(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } },
+    set(k, v) { try { if (v) localStorage.setItem(k, v); else localStorage.removeItem(k); } catch (e) { /* none */ } },
+  };
+  const key = () => store.get(KEY_STORE);
+  function setKey(k) { store.set(KEY_STORE, String(k || '').trim()); }
+
+  function voice() {
+    try { return JSON.parse(store.get(VOICE_STORE) || 'null'); } catch (e) { return null; }
+  }
+  function setVoice(v) { store.set(VOICE_STORE, v ? JSON.stringify(v) : ''); }
+
+  /* ---------- plumbing ---------- */
+  function errorFrom(status, body) {
+    const e = (body && body.error) || {};
+    const msg = e.message || ('HTTP ' + status);
+    if (status === 429 || e.status === 'RESOURCE_EXHAUSTED') return { code: 'rate_limited', message: msg, status };
+    if (status === 401 || status === 403 || /API key not valid|API_KEY_INVALID|PERMISSION_DENIED/i.test(msg)) return { code: 'bad_key', message: msg, status };
+    if (status === 400) return { code: 'invalid_request', message: msg, status };
+    if (status === 404) return { code: 'not_found', message: msg, status };
+    return { code: 'upstream_error', message: msg, status };
+  }
+  async function call(path, body, { signal, method = 'POST' } = {}) {
+    const k = key();
+    if (!k) throw { code: 'no_key', message: 'No Gemini key set' };
+    let res;
+    try {
+      res = await fetch(BASE + path, {
+        method, signal,
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': k },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    } catch (e) {
+      if (signal && signal.aborted) throw { code: 'cancelled', message: 'stopped' };
+      throw { code: 'network', message: String(e && e.message || e) };
+    }
+    if (!res.ok) {
+      let b = null;
+      try { b = await res.json(); } catch (e) { /* not JSON */ }
+      throw errorFrom(res.status, b);
+    }
+    return res;
+  }
+  // Try each model in turn; only "out of allowance" or "no such model" moves on.
+  async function withModels(models, fn) {
+    let last;
+    for (const m of models) {
+      try { return await fn(m); } catch (e) {
+        last = e;
+        if (!(e && (e.code === 'rate_limited' || e.code === 'not_found'))) throw e;
+      }
+    }
+    throw last;
+  }
+  const textOf = body => ((((body || {}).candidates || [])[0] || {}).content || {}).parts
+    ? body.candidates[0].content.parts.filter(p => typeof p.text === 'string' && !p.thought).map(p => p.text).join('')
+    : '';
+
+  /* ---------- text: grading and reviews ---------- */
+  async function grade(prompt, { signal } = {}) {
+    return withModels(MODELS.grade, async model => {
+      const res = await call(`/models/${model}:generateContent`, {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: 'application/json', temperature: 0 },
+      }, { signal });
+      const t = textOf(await res.json()).trim();
+      try { return JSON.parse(t); } catch (e) { /* look inside */ }
+      const a = t.indexOf('{'), z = t.lastIndexOf('}');
+      if (a >= 0 && z > a) return JSON.parse(t.slice(a, z + 1));
+      throw { code: 'invalid_json', message: 'No JSON', text: t };
+    });
+  }
+  async function review(prompt, { onText, signal } = {}) {
+    return withModels(MODELS.review, async model => {
+      const res = await call(`/models/${model}:streamGenerateContent?alt=sse`, {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 4096 },
+      }, { signal });
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '', text = '', truncated = false;
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+          let cut;
+          while ((cut = buf.indexOf('\n\n')) >= 0) {
+            const chunk = buf.slice(0, cut);
+            buf = buf.slice(cut + 2);
+            const data = chunk.split('\n').filter(l => l.startsWith('data:')).map(l => l.slice(5).trim()).join('');
+            if (!data) continue;
+            let ev;
+            try { ev = JSON.parse(data); } catch (e) { continue; }
+            if (ev.error) throw errorFrom(ev.error.code || 500, ev);
+            const d = textOf(ev);
+            if (d) { text += d; if (onText) onText({ text, delta: d }); }
+            const fr = ev.candidates && ev.candidates[0] && ev.candidates[0].finishReason;
+            if (fr === 'MAX_TOKENS') truncated = true;
+          }
+        }
+      } catch (e) {
+        if (signal && signal.aborted) throw { code: 'cancelled', message: 'stopped', text };
+        if (e && e.code) throw Object.assign(e, { text });
+        throw { code: 'network', message: String(e && e.message || e), text };
+      }
+      if (!text.trim()) throw { code: 'empty_completion', message: 'No text' };
+      return { text, truncated };
+    });
+  }
+
+  /* ---------- the voice ---------- */
+  const b64ToBytes = s => { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+  // WAV comes back ready to play; raw 16-bit PCM is wrapped in a WAV header.
+  function toWav(bytes, mime) {
+    if (bytes.length > 12 && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF') return new Blob([bytes], { type: 'audio/wav' });
+    const rate = +(String(mime || '').match(/rate=(\d+)/) || [])[1] || 24000;
+    const h = new ArrayBuffer(44), v = new DataView(h);
+    const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    w(0, 'RIFF'); v.setUint32(4, 36 + bytes.length, true); w(8, 'WAVE'); w(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, 'data'); v.setUint32(40, bytes.length, true);
+    return new Blob([h, bytes], { type: 'audio/wav' });
+  }
+  function audioFrom(body) {
+    // generateContent: candidates[0].content.parts[].inlineData
+    const parts = (((body.candidates || [])[0] || {}).content || {}).parts || [];
+    for (const p of parts) {
+      const d = p.inlineData || p.inline_data;
+      if (d && d.data) return toWav(b64ToBytes(d.data), d.mimeType || d.mime_type);
+    }
+    // Interactions: steps[].content[] of type audio
+    for (const st of body.steps || []) {
+      for (const c of st.content || []) {
+        if ((c.type === 'audio' || c.data) && c.data) return toWav(b64ToBytes(c.data), c.mime_type || c.mimeType);
+      }
+    }
+    if (body.output_audio && body.output_audio.data) return toWav(b64ToBytes(body.output_audio.data), body.output_audio.mime_type);
+    throw { code: 'no_audio', message: 'No audio in the reply' };
+  }
+
+  // Two request shapes are documented; whichever works is remembered.
+  const SHAPES = {
+    generate: (model, text, v) => [`/models/${model}:generateContent`, {
+      contents: [{ role: 'user', parts: [{ text }] }],
+      generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { voice: v } } },
+    }],
+    interactions: (model, text, v) => ['/interactions', {
+      model, input: [{ type: 'user_input', content: [{ type: 'text', text }] }],
+      response_format: { type: 'audio' }, generation_config: { speech_config: [{ voice: v }] },
+    }],
+  };
+  const cache = new Map();
+  async function speech(text, { signal } = {}) {
+    const v = voice();
+    if (!v || !v.id) throw { code: 'no_voice', message: 'No voice designed yet' };
+    const ck = v.id + '|' + text;
+    if (cache.has(ck)) return cache.get(ck);
+    const remembered = store.get(SHAPE_STORE);
+    const order = remembered === 'interactions' ? ['interactions', 'generate'] : ['generate', 'interactions'];
+    const blob = await withModels(MODELS.tts, async model => {
+      let last;
+      for (const shape of order) {
+        try {
+          const [path, body] = SHAPES[shape](model, text, v.id);
+          const res = await call(path, body, { signal });
+          const b = audioFrom(await res.json());
+          store.set(SHAPE_STORE, shape);
+          return b;
+        } catch (e) {
+          last = e;
+          // A shape this API does not take: try the other one.
+          if (!(e && (e.code === 'invalid_request' || e.code === 'no_audio' || e.code === 'not_found'))) throw e;
+        }
+      }
+      throw last;
+    });
+    cache.set(ck, blob);
+    if (cache.size > 80) cache.delete(cache.keys().next().value);
+    return blob;
+  }
+
+  /* Design the voice from a description and keep its id. The request body is
+     documented two ways (traits on the voice, or on its prompt), so both are
+     tried, then the bare minimum. The preview it returns is played so you
+     hear her before any question does. */
+  async function design(prompt) {
+    const input = String(prompt || DEFAULT_PROMPT).trim();
+    const tries = [
+      { store: true, voice: { model: MODELS.tts[0], type: 'prompted', display_name: 'Gooby Goober voice',
+        gender: 'female', language_code: 'en-NZ', prompted: { input } } },
+      { store: true, voice: { model: MODELS.tts[0], type: 'prompted', display_name: 'Gooby Goober voice',
+        prompted: { input, gender: 'female', language_code: 'en-NZ', region_code: 'NZ' } } },
+      { store: true, voice: { type: 'prompted', prompted: { input } } },
+    ];
+    let last;
+    for (const body of tries) {
+      try {
+        const res = await call('/voices', body);
+        const r = await res.json();
+        const v = r.voice || r;
+        const id = v.id || (v.name ? String(v.name).replace(/^voices\//, '') : '');
+        if (!id) throw { code: 'no_voice', message: 'No voice id came back' };
+        const sa = v.sample_audio || v.sampleAudio;
+        const sample = sa && sa.data ? toWav(b64ToBytes(sa.data), sa.mime_type || sa.mimeType) : null;
+        setVoice({ id, prompt: input, at: Date.now() });
+        cache.clear();
+        return { id, sample };
+      } catch (e) {
+        last = e;
+        if (!(e && e.code === 'invalid_request')) throw e;
+      }
+    }
+    throw last;
+  }
+
+  return {
+    key: () => !!key(), setKey, voice, setVoice, design, speech, grade, review,
+    DEFAULT_PROMPT, MODELS,
+  };
+})();
+
+if (typeof module !== 'undefined') module.exports = { Gemini };
+</script>
+<script>
 /* ===== The AI checker's line to Claude =====
    Two routes, one interface.
 
@@ -2986,8 +3258,9 @@ if (typeof module !== 'undefined') module.exports = { Theory, Quiz };
 
    Anywhere else (GitHub Pages, a file on disk) there is no viewer and no
    `window.claude`, so the only way to reach Claude is the Anthropic API with
-   the person's own key. The key is kept in this browser's storage and sent
-   only to api.anthropic.com. Nothing else here ever leaves the page.
+   the person's own key, sent only to api.anthropic.com. Failing that, a free
+   Gemini key does the job instead (see gemini.js). Keys stay in this
+   browser's storage.
 
    The rest of the app asks for a grade or a review and gets text back; it
    never needs to know which route answered. */
@@ -3010,9 +3283,11 @@ const Checker = (() => {
     decide();
   }
   // Decide which route is live, without asking anyone anything.
+  const hasGemini = () => typeof Gemini !== 'undefined' && Gemini.key();
   function decide() {
     if (state.sample) { state.route = 'claude'; state.status = 'ready'; }
     else if (readKey()) { state.route = 'api'; state.status = 'ready'; }
+    else if (hasGemini()) { state.route = 'gemini'; state.status = 'ready'; }
     else { state.route = 'none'; state.status = state.status === 'loading' ? 'loading' : 'none'; }
     changed();
   }
@@ -3139,6 +3414,7 @@ const Checker = (() => {
       const r = await apiCall(prompt, { model: MODELS.grade, maxTokens: 300, signal, stream: false });
       return parseJson(r.text);
     }
+    if (state.route === 'gemini') return Gemini.grade(prompt, { signal });
     throw { code: 'unavailable', message: 'No route to Claude' };
   }
 
@@ -3155,11 +3431,12 @@ const Checker = (() => {
     if (state.route === 'api') {
       return apiCall(prompt, { model: MODELS.review, maxTokens: 2400, onText, signal, stream: true });
     }
+    if (state.route === 'gemini') return Gemini.review(prompt, { onText, signal });
     throw { code: 'unavailable', message: 'No route to Claude' };
   }
 
   return {
-    init, grade, review, setKey, onChange: f => listeners.push(f),
+    init, grade, review, setKey, refresh: decide, onChange: f => listeners.push(f),
     hasKey: () => !!readKey(),
     get route() { return state.route; },
     get status() { return state.status; },
@@ -3173,13 +3450,12 @@ if (typeof module !== 'undefined') module.exports = { Checker };
 </script>
 <script>
 /* ===== Vocal mode =====
-   Two halves. The question is read out by a female Japanese voice speaking
-   the English text, which is what gives it the accent: the voices are the
-   device's own (Kyoko or O-ren on Apple, Google 日本語 in Chrome, Nanami,
-   Haruka, Ayumi or Sayaka on Windows), so which one you get depends on the
-   device, and the picker in Settings lists what this one has. A Japanese
-   engine reads digits in Japanese, so every number is written out in English
-   words before it is spoken.
+   Two halves. The question is read out by a young New Zealand woman's voice
+   designed on Gemini (see gemini.js), or, without that, by the device's own
+   female English voice nearest to it: a New Zealand one where the device has
+   it (Windows and Edge do; Apple does not), then Australian. Numbers and
+   symbols are written out as words before speaking, so every voice reads
+   them the same way.
 
    The answer comes back through the browser's speech recogniser while a
    button is held, and is parsed into the same tokens the keypads produce.
@@ -3193,28 +3469,25 @@ const Voice = (() => {
   const canListen = !!Rec;
 
   /* ---------- picking the voice ---------- */
-  const JA_FEMALE = ['kyoko', 'o-ren', 'oren', 'haruka', 'ayumi', 'nanami', 'sayaka', 'mizuki',
-    'google 日本語', 'google japanese', 'shiori', 'aoi', 'mayu', 'nanami'];
-  const JA_MALE = ['hattori', 'otoya', 'ichiro', 'keita', 'daichi', 'naoki', 'takumi', 'kenji', 'male'];
   const EN_FEMALE = ['samantha', 'karen', 'moira', 'tessa', 'fiona', 'serena', 'allison', 'ava', 'susan',
-    'zoe', 'nicky', 'kathy', 'victoria', 'zira', 'aria', 'jenny', 'michelle', 'sonia', 'libby', 'natasha', 'female'];
+    'zoe', 'nicky', 'kathy', 'victoria', 'zira', 'aria', 'jenny', 'michelle', 'sonia', 'libby', 'natasha',
+    'emma', 'clara', 'amber', 'catherine', 'hazel', 'isla', 'molly', 'google us english', 'female'];
   const EN_MALE = ['daniel', 'alex', 'fred', 'tom', 'oliver', 'arthur', 'aaron', 'gordon', 'lee', 'rishi',
-    'david', 'mark', 'guy', 'ryan', 'william', 'male'];
+    'david', 'mark', 'guy', 'ryan', 'william', 'mitchell', 'william', 'male'];
   const has = (nm, list) => list.some(x => nm.includes(x));
 
   function allVoices() {
     try { return (W.speechSynthesis && W.speechSynthesis.getVoices()) || []; } catch (e) { return []; }
   }
-  // Female Japanese voices, best first. Known male names are left out
-  // entirely — the brief is a woman's voice, never a man's.
-  function japaneseVoices() {
-    return allVoices().filter(v => /^ja/i.test(v.lang || '') && !has((v.name || '').toLowerCase(), JA_MALE))
-      .sort((a, b) => score(b, JA_FEMALE) - score(a, JA_FEMALE));
-  }
+  // Women only; a New Zealand voice first, then Australian, the nearest accent.
+  const LOCALE = l => (/^en[-_]nz/i.test(l) ? 400 : /^en[-_]au/i.test(l) ? 200 : 0);
   function englishFemale() {
-    return allVoices().filter(v => /^en/i.test(v.lang || '') && !has((v.name || '').toLowerCase(), EN_MALE)
-      && has((v.name || '').toLowerCase(), EN_FEMALE))
-      .sort((a, b) => score(b, EN_FEMALE) - score(a, EN_FEMALE));
+    return allVoices().filter(v => {
+      const nm = (v.name || '').toLowerCase(), l = v.lang || '';
+      if (!/^en/i.test(l) || has(nm, EN_MALE)) return false;
+      // A New Zealand voice with an unfamiliar name is kept unless it says it is male.
+      return has(nm, EN_FEMALE) || /^en[-_]nz/i.test(l);
+    }).sort((a, b) => (score(b, EN_FEMALE) + LOCALE(b.lang || '')) - (score(a, EN_FEMALE) + LOCALE(a.lang || '')));
   }
   function score(v, known) {
     const nm = (v.name || '').toLowerCase();
@@ -3225,10 +3498,9 @@ const Voice = (() => {
     if (v.localService) s += 10;
     return s;
   }
-  // What the picker offers: the Japanese voices, or failing that English women.
+  // What the picker offers: the device's female English voices, nearest to Kiwi first.
   function choices() {
-    const ja = japaneseVoices();
-    return { list: ja.length ? ja : englishFemale(), japanese: ja.length > 0 };
+    return { list: englishFemale() };
   }
   function pick(name) {
     const { list } = choices();
@@ -3556,18 +3828,18 @@ if (typeof module !== 'undefined') module.exports = { Voice };
   /* ---------- Difficulty ----------
      Four levels over the same drills. The drill list is never touched: a
      level only changes how hard each selected drill gets — which keys it can
-     land in, which chord shapes, whether there is a clock, and (inside the
-     engine) how wide each drill's own range runs. Answers that used to be a
-     row of options are typed now, at every level. */
+     land in, which chord shapes, how many options sit on a multiple-choice
+     pad, whether there is a clock, and (inside the engine) how wide each
+     drill's own range runs. Any option question can be typed instead. */
   const LEVELS = [
     { id: 'easy', name: 'Easy',
-      sub: 'Keys with up to 2 sharps or flats, triads only, and the key\'s notes on screen. No clock.' },
+      sub: 'Keys with up to 2 sharps or flats, triads only, 3 options, and the key\'s notes on screen. No clock.' },
     { id: 'medium', name: 'Medium',
-      sub: 'Keys up to 4 sharps or flats, the chords you picked. No clock.' },
+      sub: 'Keys up to 4 sharps or flats, the chords you picked, 4 options. No clock.' },
     { id: 'hard', name: 'Hard',
-      sub: 'All 24 keys, 7ths added, the full range of every drill. 15 seconds a question.' },
+      sub: 'All 24 keys, 7ths added, 5 options, the full range of every drill. 15 seconds a question.' },
     { id: 'god', name: 'God mode', short: 'God',
-      sub: 'Every key, every chord shape, the widest version of every drill. 7 seconds.' },
+      sub: 'Every key, every chord shape, 6 options, the widest version of every drill. 7 seconds.' },
     { id: 'custom', name: 'Custom', sub: '' },
   ];
   const LEVEL_IDS = LEVELS.map(l => l.id);
@@ -3585,17 +3857,26 @@ if (typeof module !== 'undefined') module.exports = { Voice };
   };
   const CUSTOM_CHOICES = {
     keyCap: [[0, '0'], [1, '1'], [2, '2'], [3, '3'], [4, '4'], [5, '5'], [7, 'All']],
+    opts: [[3, '3'], [4, '4'], [5, '5'], [6, '6']],
     clock: [[0, 'Off'], [3, '3s'], [5, '5s'], [7, '7s'], [10, '10s'], [15, '15s'], [20, '20s']],
     help: [[true, 'On'], [false, 'Off']],
     range: [[0, 'Narrow'], [1, 'Normal'], [2, 'Full'], [3, 'Widest']],
   };
-  const customDefaults = () => ({ keyCap: 4, clock: 0, help: false, range: 1 });
+  const customDefaults = () => ({ keyCap: 4, opts: 4, clock: 0, help: false, range: 1 });
 
   const blankStat = () => ({ n: 0, c: 0, t: 0, tn: 0 });
   const blankSession = () => ({ n: 0, c: 0, t: 0, tn: 0, streak: 0, best: 0 });
   const defaults = () => ({
     mode: 'both', auto: true, focus: 'all', level: 'medium', custom: customDefaults(),
     checker: 'all',
+    // Option questions: tap an option, or type the answer. Both always work.
+    answerStyle: 'options',
+    // Who reads the questions: Gemini's designed voice (a young Kiwi woman),
+    // or the device's own English voice. Gemini falls back to the device.
+    voiceEngine: 'gemini',
+    // Hold-to-talk is on by default wherever it can work: outside the Claude
+    // app, which blocks the microphone, and in a browser that can listen.
+    holdMic: typeof window !== 'undefined' && !window.claude && Voice.canListen,
     types: Object.fromEntries(TYPE_IDS.map(id => [id, id === 'triad'])),
     drills: Object.fromEntries(DRILL_IDS.map(id => [id, Q.DRILL[id].def !== false])),
   });
@@ -3759,6 +4040,7 @@ if (typeof module !== 'undefined') module.exports = { Voice };
   function nextQuestion() {
     clearTimeout(S.advTimer);
     stopChecker();
+    stopSpeech();
     if (S.listening) { S.listening.abort(); S.listening = null; }
     releaseUnanswered();
     const bags = { drill: S.bags.drill, key: S.bags.key };
@@ -3783,7 +4065,7 @@ if (typeof module !== 'undefined') module.exports = { Voice };
   function clockFor(q) {
     const p = profile();
     if (!p.clock || !q) return 0;
-    return 1000 * (p.clock + p.extra * Math.max(0, (q.slots || 1) - 1) + (q.input === 'choice' ? 5 : 0));
+    return 1000 * (p.clock + p.extra * Math.max(0, (q.slots || 1) - 1) + (q.input === 'choice' && S.settings.answerStyle === 'typing' ? 5 : 0));
   }
   function stopClock() {
     cancelAnimationFrame(S.clockRaf);
@@ -3839,6 +4121,7 @@ if (typeof module !== 'undefined') module.exports = { Voice };
       c.keyCap === 7 ? 'All 24 keys' : c.keyCap === 0 ? 'C major and A minor only'
         : `Keys up to ${c.keyCap} sharp${c.keyCap === 1 ? '' : 's'} or flat${c.keyCap === 1 ? '' : 's'}`,
       shapes.length ? shapes.join(', ') : 'triads',
+      `${c.opts} options`,
       c.clock ? `${c.clock}s clock` : 'no clock',
       c.help ? 'key notes shown' : null,
       `${range} drill range`,
@@ -3874,6 +4157,7 @@ if (typeof module !== 'undefined') module.exports = { Voice };
       chips.append(b);
     });
     box.append(chips);
+    row('Options per question', 'opts');
     row('Timer per question', 'clock');
     row("Key's notes on screen", 'help');
     row('Drill range', 'range');
@@ -3929,7 +4213,7 @@ if (typeof module !== 'undefined') module.exports = { Voice };
       refreshSettings();
     }
     hideStart();
-    if (S.settings.voice) Voice.unlock(S.settings.voiceName);
+    if (S.settings.voice) unlockAudio();
     nextQuestion();
   }
 
@@ -4126,9 +4410,19 @@ if (typeof module !== 'undefined') module.exports = { Voice };
         r.append(b);
       });
       pad.append(r);
+    } else if (q.input === 'choice' && S.settings.answerStyle !== 'typing') {
+      const g = el('div', 'choice-grid');
+      g.style.gridTemplateColumns = `repeat(${Math.min(q.choiceCols || q.choices.length, 7)}, 1fr)`;
+      q.choices.forEach(c => {
+        const b = button('ch-key', c);
+        b.dataset.choice = c;
+        g.append(b);
+      });
+      pad.append(g);
+      pad.append(answerSwitch('Type it instead', 'typing'));
     } else if (q.input === 'choice') {
-      /* No options to pick from: the answer is written. A box and a Check
-         button, and Enter does the same as Check. */
+      /* The same question, written: a box and a Check button, and Enter does
+         the same as Check. */
       const row = el('div', 'type-row');
       row.id = 'typeRow';
       const inp = el('input', 'type-in');
@@ -4151,6 +4445,7 @@ if (typeof module !== 'undefined') module.exports = { Voice };
       pad.append(el('p', 'type-hint', checkerOn()
         ? 'Write it however you would say it — # and b are fine. Anything that isn\'t an exact match goes to the checker.'
         : 'Write it however you would say it — # and b are fine.'));
+      pad.append(answerSwitch('Pick from options', 'options'));
       // Straight into the box on a keyboard; a phone waits for the tap.
       if (!matchMedia('(pointer: coarse)').matches) setTimeout(() => { if (S.q === q && !S.answered) inp.focus(); }, 0);
     } else if (q.input === 'interval') {
@@ -4163,6 +4458,20 @@ if (typeof module !== 'undefined') module.exports = { Voice };
       });
       pad.append(g);
     }
+  }
+
+  // Swap how option questions are answered, right on the question. It sticks.
+  function answerSwitch(label, to) {
+    const b = button('ans-switch', label, () => {
+      if (S.answered) return;
+      S.settings.answerStyle = to;
+      touched();
+      renderPad();
+      refreshSettings();
+      if (to === 'typing') { const inp = $('#ansText'); if (inp) inp.focus(); }
+    });
+    b.id = 'ansSwitch';
+    return b;
   }
 
   function renderSlots() {
@@ -4255,7 +4564,7 @@ if (typeof module !== 'undefined') module.exports = { Voice };
     updateActions();
   }
 
-  function submit(tokens, revealed = false, typed = null) {
+  function submit(tokens, revealed = false, typed = null, decided = false) {
     if (S.answered) return;
     S.answered = true;
     stopClock();
@@ -4272,7 +4581,7 @@ if (typeof module !== 'undefined') module.exports = { Voice };
     /* A typed answer that is not an exact match is not wrong yet: it may be
        the right thing in other words. The checker decides, quickly, and the
        verdict waits for it. Without the checker it is judged as written. */
-    if (typed !== null && !revealed && !timedOut && !Q.check(q, tokens) && checkerOn()) {
+    if (typed !== null && !decided && !revealed && !timedOut && !Q.check(q, tokens) && checkerOn()) {
       renderFeedback(Object.assign({ ok: false, pending: true }, base));
       gradeTyped(q, base);
       return;
@@ -4308,8 +4617,20 @@ if (typeof module !== 'undefined') module.exports = { Voice };
       if (inp) inp.focus();
       return;
     }
-    const hit = typedMatch(S.q, raw);
-    submit(hit !== null ? [hit] : [raw], false, raw);
+    submitText(raw);
+  }
+  /* Words for an option question, typed or spoken. A match for the answer
+     is right. A match for one of the other options is plainly that option,
+     so it is wrong without asking anyone. Anything else may still be the
+     right idea in other words, and goes to the checker. */
+  function submitText(raw) {
+    const q = S.q;
+    if (S.answered || !q || q.input !== 'choice') return;
+    const hit = typedMatch(q, raw);
+    if (hit !== null) return submit([hit], false, raw, true);
+    const other = (q.choices || []).find(c => typedMatch({ answer: [c], answerSuffix: q.answerSuffix }, raw) !== null);
+    if (other !== undefined) return submit([other], false, raw, true);
+    submit([raw], false, raw);
   }
 
   function record(ok, dt, revealed) {
@@ -4736,12 +5057,13 @@ if (typeof module !== 'undefined') module.exports = { Voice };
       capability_disabled: 'The checker cannot run in this view.',
       not_declared: 'The checker cannot run in this view.',
       capability_removed: 'This app version cannot run the checker — update the Claude app.',
-      rate_limited: 'Usage limit reached for now. Try again in a bit.',
+      rate_limited: Checker.route === 'gemini' ? 'Gemini\'s free allowance is used up for now. Try again later.' : 'Usage limit reached for now. Try again in a bit.',
       session_expired: 'Sign in to Claude again to use the checker.',
       refused: 'Claude declined to review this one.',
-      bad_key: 'The API key was rejected. Check it in Settings.',
+      bad_key: Checker.route === 'gemini' ? 'Gemini rejected the key. Check it in Settings.' : 'The API key was rejected. Check it in Settings.',
       no_credit: 'The API account has no credit left.',
       no_key: 'Add an API key in Settings to use the checker here.',
+      invalid_request: 'The request was refused — the details are in the console.',
       network: 'Could not reach Claude — check the connection.',
     })[code] || 'The checker could not finish this one.';
   }
@@ -4827,23 +5149,99 @@ if (typeof module !== 'undefined') module.exports = { Voice };
      The question is read out; a held button listens for the answer and
      submits what it heard when let go. */
   const voiceOn = () => !!S.settings.voice && Voice.canSpeak;
+  const holdOn = () => (voiceOn() || !!S.settings.holdMic) && Voice.canListen;
   function sayQuestion() {
     if (!voiceOn() || S.atStart || S.view !== 'quiz' || !S.q || S.answered) return;
     const q = S.q;
     const words = [Q.DRILL[q.drill].name, q.context, heroWords(q) + (q.heroCap ? ` (${q.heroCap})` : ''), q.sub]
       .filter(Boolean).join('. ');
-    Voice.speak(Voice.speakable(words), { voiceName: S.settings.voiceName });
+    speakOut(Voice.speakable(words));
   }
   function sayVerdict(q, r) {
     if (!voiceOn() || r.pending) return;
     const ans = q.answer.map(a => a + (q.answerSuffix || '')).join(', ');
     const line = r.ok ? 'Correct.' : r.revealed ? `The answer is ${ans}.`
       : r.timedOut ? `Out of time. It was ${ans}.` : `Not quite. It's ${ans}.`;
-    Voice.speak(Voice.speakable(line), { voiceName: S.settings.voiceName });
+    speakOut(Voice.speakable(line));
+  }
+  /* The one way anything is spoken. Gemini's designed voice when it is set
+     up; the device's English voice when it is not, or when Gemini can't
+     answer (the day's free allowance gone, offline) — and then it says why,
+     once, so the change of voice is never a mystery. */
+  const audioEl = typeof Audio !== 'undefined' ? new Audio() : null;
+  let ttsCtl = null;
+  const geminiVoice = () => S.settings.voiceEngine === 'gemini' && Gemini.key() && !!(Gemini.voice() || {}).id;
+  function stopSpeech() {
+    Voice.hush();
+    if (ttsCtl) { ttsCtl.abort(); ttsCtl = null; }
+    try { if (audioEl) audioEl.pause(); } catch (e) { /* ignore */ }
+  }
+  function playBlob(blob) {
+    if (!audioEl) return;
+    const url = URL.createObjectURL(blob);
+    audioEl.onended = () => URL.revokeObjectURL(url);
+    audioEl.src = url;
+    const p = audioEl.play();
+    if (p && p.catch) p.catch(() => {});
+  }
+  function speakOut(text) {
+    stopSpeech();
+    if (!geminiVoice()) { Voice.speak(text, { voiceName: S.settings.voiceName }); return; }
+    const ctl = new AbortController();
+    ttsCtl = ctl;
+    Gemini.speech(text, { signal: ctl.signal }).then(blob => {
+      if (ttsCtl !== ctl) return;
+      ttsCtl = null;
+      playBlob(blob);
+    }).catch(e => {
+      if (e && e.code === 'cancelled') return;
+      if (ttsCtl === ctl) ttsCtl = null;
+      voiceIssue(e);
+      Voice.speak(text, { voiceName: S.settings.voiceName });
+    });
+  }
+  function voiceIssue(e) {
+    const msg = geminiError(e, 'voice');
+    S.voiceIssue = msg;
+    const h = $('#heard');
+    if (h && !$('#voiceBar').hidden) h.textContent = msg;
+    const st = $('#gemStatus');
+    if (st) st.textContent = msg;
+  }
+  function geminiError(e, what) {
+    const code = e && e.code;
+    const fall = what === 'voice' ? ' Using the device voice for now.' : '';
+    return ({
+      rate_limited: 'Gemini\'s free allowance is used up for now.' + fall,
+      bad_key: 'Gemini rejected the key — check it in Settings.' + fall,
+      no_key: 'No Gemini key yet — add one in Settings.' + fall,
+      no_voice: 'The Gemini voice hasn\'t been created yet — Settings → Vocal mode.' + fall,
+      network: 'Couldn\'t reach Gemini — check the connection.' + fall,
+    })[code] || `Gemini couldn't do that (${(e && e.message) || 'unknown error'}).` + fall;
+  }
+  // iOS plays sound only after a tap has played some; this is that tap.
+  const SILENT = (() => {
+    try {
+      const h = new ArrayBuffer(44 + 800), v = new DataView(h);
+      const w = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+      w(0, 'RIFF'); v.setUint32(4, 36 + 800, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true);
+      v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, 8000, true); v.setUint32(28, 16000, true);
+      v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, 800, true);
+      return URL.createObjectURL(new Blob([h], { type: 'audio/wav' }));
+    } catch (e) { return null; }
+  })();
+  function unlockAudio() {
+    Voice.unlock(S.settings.voiceName);
+    if (!audioEl || !SILENT || audioEl.dataset.unlocked) return;
+    try {
+      audioEl.src = SILENT;
+      const p = audioEl.play();
+      if (p && p.then) p.then(() => { audioEl.dataset.unlocked = '1'; }, () => {});
+    } catch (e) { /* ignore */ }
   }
   function renderVoiceBar() {
     const bar = $('#voiceBar');
-    const on = voiceOn() && !!S.q && !S.answered;
+    const on = holdOn() && !!S.q && !S.answered;
     bar.hidden = !on;
     $('#qSay').hidden = !voiceOn();
     document.querySelector('#view-quiz .qcard').classList.toggle('has-say', voiceOn());
@@ -4854,8 +5252,8 @@ if (typeof module !== 'undefined') module.exports = { Voice };
   }
   function holdStart(e) {
     if (e) e.preventDefault();
-    if (!voiceOn() || !Voice.canListen || S.answered || S.listening) return;
-    Voice.hush();
+    if (!holdOn() || S.answered || S.listening) return;
+    stopSpeech();
     const btn = $('#holdBtn');
     btn.classList.add('on');
     btn.querySelector('.hold-main').textContent = 'Listening…';
@@ -4900,7 +5298,7 @@ if (typeof module !== 'undefined') module.exports = { Voice };
     if (q.input === 'choice') {
       const inp = $('#ansText');
       if (inp) inp.value = t;
-      submitTyped();
+      submitText(t);
       return;
     }
     let toks = [];
@@ -4930,20 +5328,77 @@ if (typeof module !== 'undefined') module.exports = { Voice };
     n.textContent = Checker.status === 'loading' ? 'Connecting…'
       : route === 'claude' ? 'Runs on your Claude account. The first check asks your permission.'
       : route === 'api' ? `Runs on your Anthropic API key (${Checker.MODELS.review} for reviews). Billed to that account.`
+      : route === 'gemini' ? `Runs free on your Gemini key (${Gemini.MODELS.review[0]} for reviews, a lighter model once the day's free allowance runs out). Reviews are less sharp than Claude's.`
       : Checker.reason ? reviewError(Checker.reason)
       : Checker.inClaude ? 'Claude is not available to this page right now.'
-      : 'Not connected. Outside the Claude app the checker needs an Anthropic API key — add one below.';
+      : 'Not connected. Add a free Gemini key above, or an Anthropic API key below.';
     const kb = $('#keyBox');
     if (kb) kb.hidden = route === 'claude';
     const ks = $('#keyState');
     if (ks) ks.textContent = Checker.hasKey() ? 'A key is saved in this browser.' : 'No key saved.';
     const rm = $('#keyRemove');
     if (rm) rm.hidden = !Checker.hasKey();
+    const gs = $('#gemState');
+    if (gs) gs.textContent = Gemini.key() ? 'A Gemini key is saved in this browser.' : 'No Gemini key saved.';
+    const gr = $('#gemRemove');
+    if (gr) gr.hidden = !Gemini.key();
     // The typed-answer hint says whether the checker will read a near miss.
     const hint = document.querySelector('#pad .type-hint');
     if (hint) hint.textContent = checkerOn()
       ? 'Write it however you would say it — # and b are fine. Anything that isn\'t an exact match goes to the checker.'
       : 'Write it however you would say it — # and b are fine.';
+  }
+  function answerSettings(v) {
+    const g = group('Answering');
+    g.append(el('p', 'subhead', 'Questions with options'));
+    g.append(segmented('answerStyle', [['options', 'Pick from options'], ['typing', 'Type it']]));
+    g.append(el('p', 'group-note', 'Either way works on any question — the link under the options swaps them there and then. Typed answers get 5 extra seconds on a clock.'));
+    const l = el('div', 'list');
+    l.append(switchRow('Hold-to-talk button', Voice.canListen
+      ? 'Hold it, say your answer, let go to submit — for any question'
+      : 'This browser can\'t listen — Safari or Chrome can', () => !!S.settings.holdMic, val => {
+      S.settings.holdMic = val;
+      touched();
+      renderVoiceBar();
+    }));
+    g.append(l);
+    g.append(el('p', 'group-note', 'The Claude app blocks the microphone, so this works on the GitHub Pages copy.'));
+    v.append(g);
+  }
+  function geminiSettings(v) {
+    const g = group('Gemini key (free)');
+    const kb = el('div', 'key-box');
+    const row = el('div', 'key-row');
+    const inp = el('input', 'type-in key-in');
+    inp.type = 'password';
+    inp.id = 'gemKey';
+    inp.placeholder = 'Gemini API key (AIza…)';
+    inp.autocomplete = 'off';
+    inp.spellcheck = false;
+    inp.setAttribute('aria-label', 'Gemini API key');
+    row.append(inp, button('btn primary', 'Save', () => {
+      if (!inp.value.trim()) return;
+      Gemini.setKey(inp.value);
+      inp.value = '';
+      Checker.refresh();
+      refreshCheckerNote();
+      refreshVoiceUI();
+    }));
+    kb.append(row);
+    const st = el('p', 'group-note');
+    st.id = 'gemState';
+    kb.append(st);
+    const rm = button('btn text', 'Remove key', () => {
+      Gemini.setKey('');
+      Checker.refresh();
+      refreshCheckerNote();
+      refreshVoiceUI();
+    });
+    rm.id = 'gemRemove';
+    kb.append(rm);
+    kb.append(el('p', 'group-note', 'Free from aistudio.google.com → Get API key. It gives the questions a young Kiwi woman\'s voice, and runs the AI checker outside the Claude app when there is no Anthropic key. The key stays in this browser and is sent only to Google.'));
+    g.append(kb);
+    v.append(g);
   }
   function checkerSettings(v) {
     const g = group('AI checker');
@@ -4979,13 +5434,54 @@ if (typeof module !== 'undefined') module.exports = { Voice };
     const l = el('div', 'list');
     l.append(switchRow('Read questions out', 'Hold the button to answer out loud', () => !!S.settings.voice, val => {
       S.settings.voice = val;
-      if (val) Voice.unlock(S.settings.voiceName);
-      else Voice.hush();
+      if (val) unlockAudio();
+      else stopSpeech();
       touched();
       renderVoiceBar();
-      fillVoicePick();
+      refreshVoiceUI();
     }));
     g.append(l);
+    const eng = segmented('voiceEngine', [['gemini', 'Gemini · Kiwi woman'], ['device', 'Device voice']]);
+    eng.id = 'voiceEngine';
+    g.append(eng);
+    // The designed voice: a description, a button to make her, a button to hear her.
+    const gb = el('div', 'gem-voice');
+    gb.id = 'gemVoiceBox';
+    const ta = el('textarea', 'gem-prompt');
+    ta.id = 'gemPrompt';
+    ta.rows = 3;
+    ta.setAttribute('aria-label', 'Describe the voice');
+    ta.value = (Gemini.voice() || {}).prompt || Gemini.DEFAULT_PROMPT;
+    const btns = el('div', 'gem-btns');
+    const make = button('btn primary', 'Create voice', async () => {
+      unlockAudio();
+      S.designing = true;
+      make.disabled = true;
+      const st = $('#gemStatus');
+      st.textContent = 'Designing her voice… this takes a few seconds.';
+      try {
+        const r = await Gemini.design(ta.value);
+        st.textContent = 'Voice ready — this is her.';
+        if (r.sample) playBlob(r.sample);
+        else speakOut(Voice.speakable('Kia ora! Which major key has exactly these sharps? F♯ C♯ G♯ D♯.'));
+      } catch (e) {
+        st.textContent = geminiError(e, 'design');
+      } finally {
+        S.designing = false;
+        refreshVoiceUI();
+      }
+    });
+    make.id = 'gemDesign';
+    const hear = button('btn text', 'Hear her', () => {
+      unlockAudio();
+      speakOut(Voice.speakable('Kia ora! Which major key has exactly these sharps? F♯ C♯ G♯ D♯.'));
+    });
+    hear.id = 'gemTry';
+    btns.append(make, hear);
+    const gst = el('p', 'group-note');
+    gst.id = 'gemStatus';
+    gb.append(el('p', 'subhead', 'Describe her voice'), ta, btns, gst);
+    g.append(gb);
     const vr = el('div', 'voice-row');
     vr.id = 'voiceRow';
     const sel = el('select', 'voice-pick');
@@ -4994,21 +5490,41 @@ if (typeof module !== 'undefined') module.exports = { Voice };
     sel.addEventListener('change', () => {
       S.settings.voiceName = sel.value;
       touched();
-      Voice.speak(Voice.speakable('Which major key has exactly these sharps? F♯ C♯ G♯ D♯.'), { voiceName: sel.value });
+      Voice.speak(Voice.speakable('Kia ora! Which major key has exactly these sharps? F♯ C♯ G♯ D♯.'), { voiceName: sel.value });
     });
     vr.append(sel, button('btn text', 'Try voice', () =>
-      Voice.speak(Voice.speakable('Which major key has exactly these sharps? F♯ C♯ G♯ D♯.'), { voiceName: S.settings.voiceName })));
+      Voice.speak(Voice.speakable('Kia ora! Which major key has exactly these sharps? F♯ C♯ G♯ D♯.'), { voiceName: S.settings.voiceName })));
     g.append(vr);
     const vn = el('p', 'group-note');
     vn.id = 'voiceNote';
     g.append(vn);
     v.append(g);
   }
+  function refreshVoiceUI() {
+    const gb = $('#gemVoiceBox');
+    if (!gb) return;
+    const gem = S.settings.voiceEngine === 'gemini';
+    gb.hidden = !S.settings.voice || !gem;
+    const eng = $('#voiceEngine');
+    if (eng) eng.hidden = !S.settings.voice;
+    const made = !!(Gemini.voice() || {}).id;
+    const make = $('#gemDesign');
+    if (make) { make.textContent = made ? 'Redo voice' : 'Create voice'; make.disabled = !!S.designing || !Gemini.key(); }
+    const hear = $('#gemTry');
+    if (hear) hear.hidden = !made;
+    const st = $('#gemStatus');
+    if (st && !st.textContent) st.textContent = !Gemini.key() ? 'Add your Gemini key above first.'
+      : made ? 'Voice ready. Edit the description and tap Redo voice to try another.'
+      : 'Tap Create voice — she will introduce herself.';
+    if (st && !Gemini.key()) st.textContent = 'Add your Gemini key above first.';
+    fillVoicePick();
+  }
   function fillVoicePick() {
     const sel = $('#voicePick'), note = $('#voiceNote'), row = $('#voiceRow');
     if (!sel) return;
-    const { list, japanese } = Voice.choices();
-    row.hidden = !S.settings.voice || !list.length;
+    const { list } = Voice.choices();
+    row.hidden = !S.settings.voice || !list.length || S.settings.voiceEngine === 'gemini';
+    note.hidden = S.settings.voiceEngine === 'gemini';
     sel.innerHTML = '';
     list.forEach(v => {
       const o = el('option', null, v.name + (v.lang ? ' · ' + v.lang : ''));
@@ -5018,8 +5534,8 @@ if (typeof module !== 'undefined') module.exports = { Voice };
     });
     note.textContent = !Voice.canSpeak ? 'This browser has no speech voices.'
       : !list.length ? 'No female voice found on this device yet. Voices often appear after the first one speaks — try again in a moment.'
-      : japanese ? 'A Japanese voice reading the English questions — that is where the accent comes from. Voices depend on the device: on iPhone, Kyoko or O-ren (add the Enhanced versions in Settings → Accessibility → Spoken Content → Voices → Japanese).'
-      : 'No Japanese voice on this device, so an English one stands in. Add one — on iPhone, Settings → Accessibility → Spoken Content → Voices → Japanese → Kyoko — then reload.';
+      : /^en[-_]nz/i.test(list[0].lang || '') ? 'A New Zealand voice from this device.'
+      : 'This device has no New Zealand voice (Apple ships none), so the nearest is used — Australian if there is one. For the Kiwi voice, use Gemini above.';
   }
 
 
@@ -5530,7 +6046,7 @@ if (typeof module !== 'undefined') module.exports = { Voice };
     const g0 = group('Difficulty');
     g0.append(segmented('level', LEVELS.map(l => [l.id, l.short || l.name])));
     g0.append(el('p', 'group-note', 'Also picked on the start screen. Easy: simple keys, triads, '
-      + 'key notes shown. Hard: all keys, 7ths, 15s clock. God: everything, 7s. '
+      + '3 options, key notes shown. Hard: all keys, 7ths, 15s clock. God: everything, 7s. '
       + 'Custom: you set each dial. Typed answers get 5 extra seconds on a clock.'));
     const cs = customEditor(null);
     cs.id = 'customSettings';
@@ -5595,10 +6111,12 @@ if (typeof module !== 'undefined') module.exports = { Voice };
     }));
     g4.append(l4);
     v.append(g1, g2, g3, g4);
+    answerSettings(v);
+    geminiSettings(v);
     checkerSettings(v);
     voiceSettings(v);
     refreshCheckerNote();
-    fillVoicePick();
+    refreshVoiceUI();
   }
 
   /* Presets are the answer to "what should I even be practising". Each one is
@@ -5666,6 +6184,18 @@ if (typeof module !== 'undefined') module.exports = { Voice };
   function changeSetting(name, val) {
     if (S.settings[name] === val) return;
     S.settings[name] = val;
+    if (name === 'voiceEngine') {
+      touched();
+      refreshSettings();
+      refreshVoiceUI();
+      return;
+    }
+    if (name === 'answerStyle') {
+      touched();
+      refreshSettings();
+      if (S.q && !S.answered && S.q.input === 'choice') renderPad();
+      return;
+    }
     if (name === 'checker') {
       if (val === 'off') stopChecker();
       touched();
@@ -5716,8 +6246,8 @@ if (typeof module !== 'undefined') module.exports = { Voice };
     });
     if (v === 'explore') renderExplore();
     if (v === 'progress') renderProgress();
-    if (v === 'settings') { refreshSettings(); refreshCheckerNote(); fillVoicePick(); }
-    if (v !== 'quiz') { Voice.hush(); if (S.listening) { S.listening.abort(); S.listening = null; resetHold(); } }
+    if (v === 'settings') { refreshSettings(); refreshCheckerNote(); refreshVoiceUI(); }
+    if (v !== 'quiz') { stopSpeech(); if (S.listening) { S.listening.abort(); S.listening = null; resetHold(); } }
     if (v === 'quiz' && S.stale) {
       S.stale = false;
       nextQuestion();
@@ -5743,6 +6273,9 @@ if (typeof module !== 'undefined') module.exports = { Voice };
     }
     if (typeof d.auto === 'boolean') s.auto = d.auto;
     if (['all', 'wrong', 'off'].includes(d.checker)) s.checker = d.checker;
+    if (['options', 'typing'].includes(d.answerStyle)) s.answerStyle = d.answerStyle;
+    if (['gemini', 'device'].includes(d.voiceEngine)) s.voiceEngine = d.voiceEngine;
+    if (typeof d.holdMic === 'boolean') s.holdMic = d.holdMic;
     if (typeof d.voice === 'boolean') s.voice = d.voice;
     if (typeof d.voiceName === 'string' && d.voiceName.length < 200) s.voiceName = d.voiceName;
     if (d.types && typeof d.types === 'object') {
@@ -5875,7 +6408,7 @@ if (typeof module !== 'undefined') module.exports = { Voice };
     hold.addEventListener('contextmenu', e => e.preventDefault());
     hold.addEventListener('keydown', e => { if ((e.key === ' ' || e.key === 'Enter') && !e.repeat) holdStart(e); });
     hold.addEventListener('keyup', e => { if (e.key === ' ' || e.key === 'Enter') holdEnd(e); });
-    $('#qSay').addEventListener('click', () => { Voice.unlock(S.settings.voiceName); sayQuestion(); });
+    $('#qSay').addEventListener('click', () => { unlockAudio(); sayQuestion(); });
     if (Voice.canSpeak) {
       try { speechSynthesis.addEventListener('voiceschanged', fillVoicePick); } catch (e) { /* ignore */ }
       setTimeout(fillVoicePick, 300);
@@ -5901,8 +6434,20 @@ if (typeof module !== 'undefined') module.exports = { Voice };
         undo();
       } else if (!S.answered && S.q.input === 'degree' && /^[1-7]$/.test(e.key)) {
         submit([T.MODES[S.q.degreeMode].labels[+e.key - 1]]);
+      } else if (!S.answered && S.q.input === 'choice' && S.settings.answerStyle !== 'typing' && /^[0-9]$/.test(e.key)) {
+        /* On a pad whose options ARE numbers — the fret pads run 0 to 11 —
+           the digit has to mean the option it reads, not the option in that
+           position. Counting positions made pressing 5 answer fret 4, which
+           is wrong in the most quietly infuriating way: it looks like you
+           misread the neck. */
+        const numeric = S.q.choices.every(c => /^\d+$/.test(c));
+        const byLabel = numeric ? S.q.choices.find(c => c === e.key) : null;
+        const pick = byLabel !== null && byLabel !== undefined
+          ? byLabel
+          : (e.key !== '0' ? S.q.choices[+e.key - 1] : null);
+        if (pick) { e.preventDefault(); submit([pick]); }
       } else if (!S.answered && S.q.input === 'choice' && e.key.length === 1 && /\S/.test(e.key)) {
-        // A typed question: the first key pressed anywhere starts the answer.
+        // Typing: the first key pressed anywhere starts the answer.
         const inp = $('#ansText');
         if (inp) inp.focus();
       }
@@ -5958,6 +6503,7 @@ if (typeof module !== 'undefined') module.exports = { Voice };
       atStart: () => !!S.atStart,
       clockMs: () => clockFor(S.q),
       choices: () => (S.q && S.q.choices ? S.q.choices.slice() : null),
+      answerStyle: v => { if (v) { S.settings.answerStyle = v; if (S.q && !S.answered) renderPad(); } return S.settings.answerStyle; },
       type: text => {
         if (S.answered || !S.q || S.q.input !== 'choice') return false;
         $('#ansText').value = text; submitTyped(); return true;
@@ -5988,3 +6534,5 @@ if (typeof module !== 'undefined') module.exports = { Voice };
 </script>
 </body>
 </html>
+
+</body></html>
